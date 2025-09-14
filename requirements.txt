@@ -4,5 +4,11 @@ altair>=5.2,<6
 sqlalchemy>=2.0,<3
 pymysql>=1.1,<2
 
-openai>=1.0,<2            # 최신 OpenAI Python SDK (from openai import OpenAI)  :contentReference[oaicite:1]{index=1}
-mysql-connector-python>=9.0,<10   # mysql.connector 드라이버               :contentReference[oaicite:2]{index=2}
+
+
+# app.py 채점/DB용
+openai>=1.44,<2
+mysql-connector-python==8.4.0
+
+# 런처/바이너리 충돌 완화(세그폴트 예방용 권장 핀)
+protobuf==4.25.3
