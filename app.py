@@ -1,12 +1,11 @@
-# app.py — 서술형 평가(3문항: 2-1/2-2 포함) · 성취수준 채점(A–D) · pr.DAT3 저장
+# app.py — 서술형 평가(3문항: 2-1/2-2 포함) · 성취수준 채점(A–D) · pr.DAT3 저장 (PyMySQL/Streamlit SQL 통일)
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import os, re, json, textwrap
 from typing import Dict, Any, List, Tuple, Optional
 
 import streamlit as st
-import mysql.connector
-from mysql.connector import Error as MySQLError
+from sqlalchemy import text
 from openai import OpenAI
 
 # ───────────────────────── 페이지/모델 ─────────────────────────
@@ -23,39 +22,40 @@ def _compile_id_regex() -> re.Pattern:
     except re.error: return re.compile(r"^\d{5,10}$")
 ID_RE = _compile_id_regex()
 
-# ───────────────────────── MySQL 연결 ─────────────────────────
-@st.cache_resource(show_spinner=False)
-def get_mysql_conn():
-    cfg = st.secrets.get("connections", {}).get("mysql", {})
-    return mysql.connector.connect(
-        host=cfg.get("host"),
-        port=cfg.get("port", 3306),
-        database=cfg.get("database", "pr"),
-        user=cfg.get("user"),
-        password=cfg.get("password"),
-        autocommit=True,
+# ───────────────────────── DB 연결 (PyMySQL/Streamlit SQL) ─────────────────────────
+try:
+    db = st.secrets.connections.mysql
+    conn = st.connection(
+        "mysql", type="sql", dialect="mysql",
+        host=db.host, port=db.port, database=db.database,
+        username=db.user, password=db.password
     )
+    # 헬스체크
+    conn.query("SELECT 1;")
+    DB_STATUS = "ONLINE"
+except Exception as e:
+    conn = None
+    DB_STATUS = f"OFFLINE: {e}"
 
-def live_conn():
-    conn = get_mysql_conn()
-    if not conn.is_connected():
-        conn.reconnect(attempts=3, delay=1)
-    return conn
+st.caption(f"DB 상태: {DB_STATUS}")
 
 def assert_table_exists():
+    if DB_STATUS != "ONLINE":
+        st.error("DB 연결이 오프라인입니다. secrets 또는 네트워크/방화벽을 확인하세요.")
+        st.stop()
     try:
-        conn = live_conn()
-        cur = conn.cursor(buffered=True)
-        cur.execute("""
-            SELECT COUNT(*)
+        df = conn.query(
+            """
+            SELECT COUNT(*) AS cnt
             FROM information_schema.tables
-            WHERE table_schema=%s AND table_name=%s
-        """, (conn.database or "pr", "DAT3"))
-        if cur.fetchone()[0] == 0:
+            WHERE table_schema = :db AND table_name = 'DAT3';
+            """,
+            params={"db": db.database},
+        )
+        if df.iloc[0]["cnt"] == 0:
             st.error("DAT3 테이블이 존재하지 않습니다. 워크벤치에서 pr.DAT3를 생성해 주세요.")
             st.stop()
-        cur.close()
-    except MySQLError as e:
+    except Exception as e:
         st.error(f"[DB 점검 실패] {e}")
         st.stop()
 
@@ -63,51 +63,54 @@ assert_table_exists()
 
 def insert_row(row: Dict[str, Any]) -> bool:
     try:
-        conn = live_conn()
-        cur = conn.cursor(buffered=True)
-        cur.execute("""
-            INSERT INTO DAT3
-            (id, answer1, feedback1, answer2, feedback2, answer3, feedback3, answer4, feedback4, opinion1)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            row.get("id"),
-            row.get("answer1"), row.get("feedback1"),
-            row.get("answer2"), row.get("feedback2"),
-            row.get("answer3"), row.get("feedback3"),
-            row.get("answer4"), row.get("feedback4"),
-            row.get("opinion1", ""),
-        ))
-        cur.close()
+        with conn.session as s:
+            s.execute(
+                text("""
+                    INSERT INTO DAT3
+                    (id, answer1, feedback1, answer2, feedback2, answer3, feedback3, answer4, feedback4, opinion1)
+                    VALUES (:id,:a1,:f1,:a2,:f2,:a3,:f3,:a4,:f4,:op)
+                """),
+                params={
+                    "id": row.get("id"),
+                    "a1": row.get("answer1"), "f1": row.get("feedback1"),
+                    "a2": row.get("answer2"), "f2": row.get("feedback2"),
+                    "a3": row.get("answer3"), "f3": row.get("feedback3"),
+                    "a4": row.get("answer4"), "f4": row.get("feedback4"),
+                    "op": row.get("opinion1", ""),
+                }
+            )
+            s.commit()
         return True
-    except MySQLError as e:
+    except Exception as e:
         st.error(f"[DB] 저장 실패: {e}")
         return False
 
-def _has_time_column(conn) -> bool:
-    cur = conn.cursor(buffered=True)
-    cur.execute("""
-        SELECT COUNT(*) FROM information_schema.columns
-        WHERE table_schema=%s AND table_name=%s AND column_name='time'
-    """, (conn.database or "pr", "DAT3"))
-    has = cur.fetchone()[0] > 0
-    cur.close()
-    return has
+def _has_time_column() -> bool:
+    try:
+        df = conn.query(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM information_schema.columns
+            WHERE table_schema=:db AND table_name='DAT3' AND column_name='time';
+            """,
+            params={"db": db.database},
+        )
+        return df.iloc[0]["cnt"] > 0
+    except Exception:
+        return False
 
 def update_latest_opinion(student_id: str, opinion: str) -> bool:
-    """해당 id의 최신 1건을 우선, 불가 시 1건 업데이트로 폴백"""
     try:
-        conn = live_conn()
-        cur = conn.cursor(buffered=True)
-        if _has_time_column(conn):
-            sql = "UPDATE DAT3 SET opinion1=%s WHERE id=%s ORDER BY time DESC LIMIT 1"
-            params = (opinion, student_id)
-        else:
-            sql = "UPDATE DAT3 SET opinion1=%s WHERE id=%s LIMIT 1"
-            params = (opinion, student_id)
-        cur.execute(sql, params)
-        cur.close()
+        sql = (
+            "UPDATE DAT3 SET opinion1=:op WHERE id=:id ORDER BY time DESC LIMIT 1"
+            if _has_time_column()
+            else "UPDATE DAT3 SET opinion1=:op WHERE id=:id LIMIT 1"
+        )
+        with conn.session as s:
+            s.execute(text(sql), params={"op": opinion, "id": student_id})
+            s.commit()
         return True
-    except MySQLError as e:
+    except Exception as e:
         st.error(f"[DB] 의견 저장 실패: {e}")
         return False
 
@@ -172,7 +175,7 @@ def build_messages(payload: Dict[str,str]) -> Tuple[str,str]:
         "학생 답안을 성취수준(A/B/C/D)으로만 평가하고 간결한 피드백을 제공합니다. "
         "출력은 반드시 JSON 한 개로만 작성하세요."
     )
-    # Q3의 요구를 '캠프장에서 음료수를 시원하게 하는 아이디어 2가지'로 단순화(각 항목 3요소 필수)
+    # Q3: 캠프장 아이디어 2가지(각 항목 3요소 필수)
     rubric = textwrap.dedent("""
     [채점 운영 원칙]
     - 등급만 사용(A/B/C/D), 점수 없음. 예시 답안/채점기준을 우선 적용.
@@ -183,49 +186,24 @@ def build_messages(payload: Dict[str,str]) -> Tuple[str,str]:
     [문항별 체크리스트와 등급 매핑]
     ■ Q1 (분류와 기준 진술)
       체크(3):
-        1) 분류쌍 정확: {(가,다)=흡수}, {(나,라)=방출} (순서 자유, 쌍 구성 정확)
-        2) 열에너지 출입 명시: ‘흡수/방출’ 용어로 두 쌍의 열 출입을 명확히 진술
-        3) 기준문장: “열에너지의 출입에 따라 분류”와 같은 분류 기준 문장 존재(인과 일치)
-      등급:
-        - A: 1,2,3 모두 충족(오류·모순 없음)
-        - B: 1 충족 + (2 또는 3 중 1개만 충족) / 표현이 다소 모호하나 방향성은 정확
-        - C: 1만 충족(2,3 부실) 또는 1이 부분만 정확(한 쌍만 맞음)
-        - D: 분류 틀림(방향 반대·쌍 오류) 또는 열 출입 진술이 모순
+        1) 분류쌍 정확: {(가,다)=흡수}, {(나,라)=방출}
+        2) 열에너지 출입 명시(흡수/방출)
+        3) 분류 기준 문장 존재(인과 일치)
+      등급: A(3/3) · B(2/3) · C(1/3) · D(0/3 또는 반대/모순)
 
-    ■ Q2-1 (액→고, 입자 관점 5요소)
-      체크(5):
-        a) 상태: 액체→고체(응고 과정)
-        b) 입자 종류: 불변
-        c) 입자 개수: 불변
-        d) 입자 사이 거리: 감소
-        e) 입자 배열: 규칙적(더 질서정연)
-      등급:
-        - A: 5/5
-        - B: 3–4/5
-        - C: 1–2/5
-        - D: 0/5 또는 반대 진술(예: 고→액, 거리 증가 등)
+    ■ Q2-1 (액→고, 입자 5요소)
+      체크(5): 상태(액→고), 종류=불변, 개수=불변, 거리=감소, 배열=규칙적
+      등급: A(5) · B(3–4) · C(1–2) · D(0 또는 반대)
 
     ■ Q2-2 (응고 + 방출)
-      체크(2):
-        a) 상태 변화: 액체→고체(‘응고’ 포함 가능)
-        b) 열에너지: 주위로 ‘방출’
-      등급:
-        - A: 2/2
-        - B: a만 정확하고 b가 모호/불완전
-        - C: 일부 오류 또는 불완전(방출 대신 감소 등 애매)
-        - D: 방향 반대(흡수) 또는 상태 변화 오기
+      체크(2): 액→고(응고), 열에너지 방출
+      등급: A(2) · B(1) · C(0/모호) · D(역방향)
 
     ■ Q3 (캠프장에서 음료수 캔을 시원하게 하는 아이디어 2)
-      요구: 아이디어 2가지 제시.
-      각 아이디어의 필수 3요소: (i) 상태 전/후, (ii) 열에너지 출입(흡수/방출), (iii) 주위 온도 변화
-      카운트:
-        - camp_ok: 3요소를 모두 갖춘 캠프 아이디어 수(0–2)
-      등급:
-        - A: camp_ok=2, 과학적 오류 없음, 글 흐름 양호
-        - B: camp_ok=1(정확) 또는 2이나 경미한 누락/모호 표현
-        - C: camp_ok=0이지만 부분 요소는 일부 언급(불완전) 또는 오개념 일부
-        - D: camp_ok=0이며 과학적 오류/요구 불충족 심함
-
+      각 아이디어 필수 3요소: (i) 상태 전/후, (ii) 열 출입(흡수/방출), (iii) 주위 온도 변화
+      카운트: camp_ok = 3요소를 모두 갖춘 아이디어 수(0–2)
+      등급: A(camp_ok=2) · B(camp_ok=1 또는 경미한 누락) · C(부분 요소만) · D(요구 불충족/오개념)
+    
     [출력 JSON 스키마]
     {
       "q1":   {"level":"A|B|C|D","feedback":"...", "detected":{"grouping_correct":bool,"mentions_inout":bool,"criterion_sentence":bool}},
@@ -234,8 +212,8 @@ def build_messages(payload: Dict[str,str]) -> Tuple[str,str]:
       "q3":   {"level":"A|B|C|D","feedback":"...", "detected":{"camp_ok":0-2}}
     }
 
-    [피드백 작성]
-    - 각 문항 2–3문장, 간결한 한국어. 요구 조건 중 부족한 요소를 직접 지적하고 보완 방향 제시.
+    [피드백]
+    - 각 문항 2–3문장, 부족 요소를 지적하고 보완 방향 제시.
     """).strip()
 
     user = {
@@ -434,7 +412,6 @@ if submit:
     })
 
     if saved:
-        # ▶ 의견 UI를 rerun 후에도 계속 보이도록 세션 플래그 설정
         st.session_state["ready_for_opinion"] = True
         st.session_state["opinion_target_id"] = (student_id or "").strip()
         st.info("제출/저장이 완료되었습니다. 이어서 ‘한 가지 의견’을 작성하면 최근 제출 내역에 반영됩니다.")
