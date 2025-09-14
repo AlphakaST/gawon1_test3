@@ -4,8 +4,8 @@ import streamlit as st
 st.set_page_config(page_title="수업 포털", page_icon="📚", layout="wide")
 
 # 실제 파일 경로(여기만 여러분 레포 구조에 맞게 수정)
-GRAPH_PAGE = "pages/1_graph.py"   # ex) pages/1_📈열에너지_그래프.py
-ASSESS_PAGE = "pages/2_app.py"    # ex) pages/2_🧪서술형_평가.py
+GRAPH_PAGE = "pages/1_📈열에너지_그래프.py"   # ex) pages/1_📈열에너지_그래프.py
+ASSESS_PAGE = "pages/2_🧪서술형_평가.py"    # ex) pages/2_🧪서술형_평가.py
 
 st.title("📚 수업 포털")
 st.caption("열에너지 그래프 작성과 서술형 평가 채점을 한 곳에서 제공합니다.")
